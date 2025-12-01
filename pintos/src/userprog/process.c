@@ -14,12 +14,24 @@
 #include "threads/flags.h"
 #include "threads/init.h"
 #include "threads/interrupt.h"
+#include "threads/malloc.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
+
+
+
+struct process_args
+{
+  char *cmdline;
+  struct child_status *status;
+};
+
+
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -28,20 +40,67 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  struct process_args* args;   // Контейнер для передачи аргументов потоку
+  struct child_status* status; // Структура о состоянии ребёнка
+  char *fn_copy;               // Копия командной строки
+  char name_copy[64];          // Для извлечения имени программы
+  char *save_ptr;              // Указатель на позицию внутри строки(для strtok_r)
+  char *prog_name;             // Имя исполнямого файла
   tid_t tid;
 
-  /* Make a copy of FILE_NAME.
+  /* Копируем командную строку.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
+  /* Создание child_status и инициализация */
+  status = malloc(sizeof *status);
+  if (status==NULL)
+  {
+    palloc_free_page(fn_copy);
+    return TID_ERROR;
+  }
+  status->exit_status = -1;
+  status->exited = false;
+  status->waited=false;
+  sema_init(&status->sema,0);
+  status->load_success = false;
+  sema_init(&status->sema_load,0);
+  /* ===================================== */
+  
+  /* Создаём структуру process_args */
+  args = malloc(sizeof *args);
+  if(args==NULL)
+  {
+    free(status);
+    palloc_free_page(fn_copy);
+    return TID_ERROR;
+  }
+  args->cmdline=fn_copy;
+  args->status = status;
+  /* =============================  */
+  
+  /* Извлекаем имя программы */
+  strlcpy(name_copy,file_name,sizeof name_copy);
+  prog_name = strtok_r(name_copy, " ", &save_ptr);
+  if (prog_name==NULL)
+    prog_name=name_copy;
+
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, args);
   if (tid == TID_ERROR)
+  {
+    free(args);
+    free(status);
     palloc_free_page (fn_copy); 
+  }
+  else
+  {
+    status->tid=tid;
+    list_push_back(&thread_current()->children, &status->elem);
+  }
   return tid;
 }
 
@@ -50,16 +109,36 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  struct process_args *proc_args=file_name_;     // Приводит указатель к типу struct process_args
+  char *file_name = proc_args ->cmdline;         // Извлекаем строку командной строки
+  struct child_status *status=proc_args->status; // Извлекаем структуру состояния
+  struct thread *cur = thread_current();         // Получаем структуру текущего потока
   struct intr_frame if_;
   bool success;
 
+
+  cur->child_status = status;                       // Связываем поток и его child_status
+  char prog_copy[sizeof cur->prog_name];            // Делаем копию для извлечения имени программы
+  strlcpy (prog_copy,file_name,sizeof prog_copy);
+  char* save_ptr;
+  char* prog = strtok_r(prog_copy, " ", &save_ptr); // Получаем имя программы
+  if(prog!=NULL)
+    strlcpy(cur->prog_name,prog,sizeof cur->prog_name); // Сохраняем имя программы в thread
+  else
+    cur->prog_name[0]='\0';
+  cur->exit_status = -1;                            // Код завершения по умолчанию
+  free(proc_args);                                  // Освобождаем временную структуру
+
   /* Initialize interrupt frame and load executable. */
-  memset (&if_, 0, sizeof if_);
+  memset (&if_, 0, sizeof if_);  // Обнуление все регистров
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
+  // Загружаем программу в память и строим пользовательский стек
   success = load (file_name, &if_.eip, &if_.esp);
+  
+  status->load_success = success;
+  sema_up(&status->sema_load);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
@@ -86,9 +165,23 @@ start_process (void *file_name_)
    This function will be implemented in problem 2-2.  For now, it
    does nothing. */
 int
-process_wait (tid_t child_tid UNUSED) 
+process_wait (tid_t child_tid) // Родительский процесс вызывает wait , чтобы дождаться завершения конкретного ребёнка
 {
-  return -1;
+  struct child_status *status = find_child_status(thread_current(),child_tid);
+
+  if (status == NULL || status ->waited)
+    return -1;
+
+  status->waited = true; // Мы начали ждать
+  if(!status->exited)
+    sema_down(&status->sema); /* Если ребёнок ещё не завершился ждём.
+    Когда он завершится, то вызовет process_exit(из thread_exit в thread.c),
+    sema_up */
+
+  list_remove(&status->elem);
+  int exit_status = status->exit_status;
+  free(status);
+  return exit_status;
 }
 
 /* Free the current process's resources. */
@@ -97,6 +190,16 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
+
+  if(cur->child_status !=NULL)
+  {
+    cur->child_status->exit_status = cur->exit_status; // Сохраняем код завершения ребёнка
+    cur->child_status->exited = true;
+    sema_up(&cur->child_status->sema);
+  }
+
+  if (cur->pagedir != NULL)
+    printf("%s: exit(%d)\n",cur->prog_name, cur->exit_status);
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
@@ -201,6 +304,20 @@ static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
                           bool writable);
 
+struct child_status *find_child_status(struct thread *t, tid_t child_tid)
+{
+  struct list_elem *e;
+
+  for(e=list_begin(&t->children);e!=list_end(&t->children);e=list_next(e))
+  {
+    struct child_status *child=list_entry(e,struct child_status,elem);
+    if (child->tid == child_tid)
+      return child;
+  }
+  return NULL;
+}
+
+
 /* Loads an ELF executable from FILE_NAME into the current thread.
    Stores the executable's entry point into *EIP
    and its initial stack pointer into *ESP.
@@ -213,8 +330,38 @@ load (const char *file_name, void (**eip) (void), void **esp)
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
+  char *file_name_copy = NULL; // Для имени программы
+  char *cmdline_copy = NULL;   // для argv[]
+  char *argv[64];              // Массив указателей на аргументы
+  uint32_t argv_addresses[64]; // Адреса аргументов в пользовательском стеке
+  int argc=0;                  // Кол-во аргументов
   int i;
 
+  cmdline_copy = palloc_get_page(0);
+  file_name_copy = palloc_get_page(0);
+  if(cmdline_copy ==NULL || file_name_copy == NULL)
+    goto done;
+
+  strlcpy(cmdline_copy,file_name,PGSIZE);
+  strlcpy(file_name_copy,file_name,PGSIZE);
+
+  char *save_ptr;
+  char *prog_name = strtok_r(file_name_copy, " ", &save_ptr);
+  if(prog_name==NULL)
+    goto done;
+
+  char *token;
+  char *arg_save_ptr;
+  token=strtok_r(cmdline_copy, " ",&arg_save_ptr);
+  while(token !=NULL)
+  {
+    if(argc>=64)
+      goto done;
+
+    argv[argc++] = token;
+
+    token = strtok_r(NULL, " ", &arg_save_ptr);
+  }
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) 
@@ -222,10 +369,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   /* Open executable file. */
-  file = filesys_open (file_name);
+  file = filesys_open (prog_name);
   if (file == NULL) 
     {
-      printf ("load: %s: open failed\n", file_name);
+      printf ("load: %s: open failed\n", prog_name);
       goto done; 
     }
 
@@ -293,7 +440,10 @@ load (const char *file_name, void (**eip) (void), void **esp)
                 }
               if (!load_segment (file, file_page, (void *) mem_page,
                                  read_bytes, zero_bytes, writable))
+              {
                 goto done;
+              }
+                
             }
           else
             goto done;
@@ -305,6 +455,43 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (!setup_stack (esp))
     goto done;
 
+  uint8_t *sp = *esp;  // Вершина стека
+  for(i = argc -1; i>=0; i--) // Сначала кладём в стек сами аргументы
+  {
+    size_t len = strlen(argv[i])+1;
+    sp -= len;
+    memcpy (sp,argv[i],len);
+    argv_addresses[i] = (uint32_t) sp;
+  }
+
+  size_t padding = (size_t) sp%4; // Делаем выравнивание для массивов указателей (4 byte)
+  if (padding!=0)
+  {
+    sp -= padding;
+    memset(sp,0,padding);
+  }
+
+  sp -=sizeof  (char*); // Отступаем 4 байта, для конца массива указателей
+  *(char **) sp = NULL; 
+
+  for(i = argc -1; i>=0; i--)
+  {
+    sp -= sizeof(char *);
+    *(char **) sp = (char *) argv_addresses[i]; // Записываем указатели на значения в стек
+  }
+
+  char **argv_start = (char **) sp; // Указатель на начало массива
+  sp -= sizeof (char **);           // Сдвигаемся на 4 байта
+  *(char ***) sp = argv_start;      // Записываем указатель на начало массива
+
+  sp-=sizeof(int);    //Кладём argc
+  *(int *) sp = argc;
+
+  sp-= sizeof(void *); // Кладём фейковый return address
+  *(void **) sp =NULL;
+
+  *esp = sp;
+
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
@@ -312,7 +499,12 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  if (cmdline_copy!=NULL)
+    palloc_free_page(cmdline_copy);
+  if (file_name_copy !=NULL)
+    palloc_free_page(file_name_copy);
+  if (file !=NULL)
+    file_close(file);
   return success;
 }
 

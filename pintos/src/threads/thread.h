@@ -5,6 +5,10 @@
 #include <list.h>
 #include <stdint.h>
 
+#ifdef USERPROG
+struct child_status; // Существует такая структура (process.c)
+#endif
+
 /* States in a thread's life cycle. */
 enum thread_status
   {
@@ -96,6 +100,11 @@ struct thread
 #ifdef USERPROG
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
+    struct thread* parent;              // Указатель на родительский процесс
+    struct list children;               // Список дочерних процессов
+    struct child_status* child_status;  // Структура состояния процесса 
+    int exit_status;                    // Код завершения процесса      
+    char prog_name[64];                 // Имя исполняемой программы
 #endif
 
     /* Owned by thread.c. */

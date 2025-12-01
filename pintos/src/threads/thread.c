@@ -182,6 +182,9 @@ thread_create (const char *name, int priority,
 
   /* Initialize thread. */
   init_thread (t, name, priority);
+  #ifdef USERPROG
+  t->parent=thread_current();
+  #endif
   tid = t->tid = allocate_tid ();
 
   /* Prepare thread for first run by initializing its stack.
@@ -469,6 +472,13 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
+  #ifdef USERPROG
+  t->parent = NULL;
+  list_init(&t->children);
+  t->child_status=NULL;
+  t->exit_status=-1;
+  strlcpy(t->prog_name, name, sizeof t->prog_name);
+  #endif
   list_push_back (&all_list, &t->allelem);
 }
 
