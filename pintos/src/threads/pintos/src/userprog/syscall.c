@@ -3,17 +3,15 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <syscall-nr.h>
+#include "devices/shutdown.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
 #include "userprog/process.h"
-#include "devices/shutdown.h"
-
 
 static void syscall_handler (struct intr_frame *);
 static void validate_user_pointer(const void *uaddr);
-static void validate_user_string(const char *uaddr);
 static void sys_exit(int statis) NO_RETURN;
 
 void
@@ -32,31 +30,14 @@ syscall_handler (struct intr_frame *f)
 
   switch(syscall_number)
   {
-  case SYS_EXEC:
-	validate_user_pointer(usp+1);
-	validate_user_string((const char *) usp[1]);
-	f->eax = process_execute((const char *) usp[1]);
-	break;
-
-  case SYS_WAIT:
-	validate_user_pointer(usp+1);
-	f->eax = process_wait((tid_t)usp[1]);
-	break;
-	  
-	  
   case SYS_HALT:
-	shutdown_power_off();
-	break;
-	
-	  
-	
-
-	 
+    shutdown_power_off();
+    break;
   case SYS_EXIT:
     validate_user_pointer(usp+1);
     sys_exit((int)usp[1]);
     break;
-  case SYS_WRITE: //write(fd(stdin-0,stdout-1), buffer, size)
+  case SYS_WRITE:
     validate_user_pointer(usp+1);
     validate_user_pointer(usp+2);
     validate_user_pointer(usp+3);
@@ -67,8 +48,8 @@ syscall_handler (struct intr_frame *f)
 
       if (size>0)
       {
-        validate_user_pointer((const uint8_t *) buffer); // проверяем начало буфера
-        validate_user_pointer((const uint8_t *) buffer +size -1); // проверяем конец буфера
+        validate_user_pointer((const uint8_t *) buffer);
+        validate_user_pointer((const uint8_t *) buffer +size -1);
       }
 
       if (fd==1)
@@ -94,27 +75,6 @@ static void validate_user_pointer(const void *uaddr)
     sys_exit(-1);
   }
 }
-
-static void validate_user_string(const char *uaddr)
-{
-	while(true)
-	{
-		validate_user_pointer(uaddr);
-		if(*uaddr=='\0')
-			break;
-			
-		void* next_page=pg_round_up(uaddr+1);
-		while((void *) uaddr<next_page)
-		{
-			validate_user_pointer(uaddr);
-			if(*uaddr=='\0')
-				return;
-			uaddr++;
-		}
-		
-	}
-}
-
 
 static void sys_exit(int status)
 {

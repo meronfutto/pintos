@@ -12,8 +12,9 @@ struct child_status
   bool waited;            // Флаг " на него уже вызвали wait "
   struct semaphore sema;  /* Синхронизация родителя и ребёнка,
                              Родитель ждёт пока ребёнок завершится */
-  struct semaphore sema_load;
+  struct semaphore load_sema;
   bool load_success;
+  bool load_complete;
   struct list_elem elem;  // Элемент списка детей
 };
 
